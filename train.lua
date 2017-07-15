@@ -21,9 +21,9 @@ cmd:text('Options')
 
 -- Data input settings
 
-cmd:option('-input_h5','/data/coco/cocotalk.h5','path to the h5file containing the preprocessed dataset')
-cmd:option('-input_json','/data/coco/cocotalk.json','path to the json file containing additional info and vocab')
-cmd:option('-cnn_model','../image_model/resnet-152.t7','path to CNN model file containing the weights, Caffe format. Note this MUST be a VGGNet-16 right now.')
+cmd:option('-input_h5','/data1/dmye/mscoco/cocotalk_challenge.h5','path to the h5file containing the preprocessed dataset')
+cmd:option('-input_json','/data1/dmye/mscoco/cocotalk_challenge.json','path to the json file containing additional info and vocab')
+cmd:option('-cnn_model','/home/dmye/resnet-152.t7','path to CNN model file containing the weights, Caffe format. Note this MUST be a VGGNet-16 right now.')
 
 cmd:option('-start_from', '', 'path to a model checkpoint to initialize model weights from. Empty = don\'t')
 cmd:option('-checkpoint_path', 'save/', 'folder to save checkpoints into (empty = this folder)')
@@ -133,16 +133,18 @@ if opt.start_from ~= '' then -- just copy to gpu1 params
   protos.cnn_fc = loaded_checkpoint.protos.cnn_fc:cuda()
 else
   local cnn_raw = torch.load(opt.cnn_model)
-
+  -- 1~5
   protos.cnn_conv_fix = net_utils.build_residual_cnn_conv_fix(cnn_raw, 
                       {backend = cnn_backend, start_layer_num = opt.finetune_start_layer}):cuda()
-
+  -- 6~8
   protos.cnn_conv = net_utils.build_residual_cnn_conv(cnn_raw, 
                       {backend = cnn_backend, start_layer_num = opt.finetune_start_layer}):cuda()
-
+  -- 9~10
   protos.cnn_fc = net_utils.build_residual_cnn_fc(cnn_raw, 
                       {backend = cnn_backend}):cuda()
 end
+
+-- layer that expands features out so we can forward multiple sentences per image
 protos.expanderConv = nn.FeatExpanderConv(opt.seq_per_img):cuda()
 protos.expanderFC = nn.FeatExpander(opt.seq_per_img):cuda()
 protos.transform_cnn_conv = net_utils.transform_cnn_conv(opt.conv_size):cuda()
@@ -364,6 +366,8 @@ local val_loss_history = {}
 local checkpoint_path = path.join(opt.checkpoint_path, 'model_id' .. opt.id)
 local timer = torch.Timer()
 
+--local val_loss, val_predictions, lang_stats = evaluate_split('val', {val_images_use = opt.val_images_use})  
+
 for epoch = startEpoch, opt.nEpochs do
 
   -- doing the learning rate decay
@@ -409,5 +413,4 @@ for epoch = startEpoch, opt.nEpochs do
     torch.save(checkpoint_path .. '_' .. epoch .. '.t7', checkpoint)
     print('wrote checkpoint to ' .. checkpoint_path .. '_' .. epoch .. '.t7')
   end
-
 end

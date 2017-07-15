@@ -53,6 +53,8 @@ function layer:_createInitState(batch_size)
   assert(batch_size ~= nil, 'batch size must be provided')
   -- construct the initial state for the LSTM
   if not self.init_state then self.init_state = {} end -- lazy init
+
+
   for h=1,self.num_layers*2 do
     -- note, the init state Must be zeros because we are using init_state to init grads in backward call too
     if self.init_state[h] then
@@ -64,6 +66,14 @@ function layer:_createInitState(batch_size)
     end
   end
   self.num_state = #self.init_state
+
+  if self.init_state_c then
+      if self.init_state_c:size(1) ~= batch_size then
+         self.init_state_c:resize(batch_size, 50):zero()
+      end
+  else
+    self.init_state_c = torch.zeros(batch_size, 50)
+  end
 end
 
 
@@ -140,6 +150,7 @@ function layer:sample(inputs, opt)
 
   self:_createInitState(batch_size)
   local state = self.init_state
+  local prev_c = self.init_state_c
   
   local img_input = {conv, fc}
   local conv_feat, conv_feat_embed, fc_embed = unpack(self.img_embedding:forward(img_input))
@@ -150,6 +161,8 @@ function layer:sample(inputs, opt)
 
   local logprobs  -- logprobs predicted in last time step
   local x_xt
+
+
 
   for t=1,self.seq_length+1 do
     local xt, it, sampleLogprobs
@@ -191,15 +204,16 @@ function layer:sample(inputs, opt)
     local h_out = out[self.num_state+1]
     local p_out = out[self.num_state+2]
 
-    local atten_input = {h_out, p_out, conv_feat, conv_feat_embed}
-    logprobs = self.attention:forward(atten_input)
-
+    local atten_input = {h_out, p_out, conv_feat, conv_feat_embed, prev_c}
+    local out_att= self.attention:forward(atten_input)
+    logprobs = out_att[1]
+    prev_c = out_att[2]
   end
   -- return the samples and their log likelihoods
   return seq, seqLogprobs
 end
 
-
+-- wait to do
 function layer:sample_beam(inputs, opt)
   local beam_size = utils.getopt(opt, 'beam_size', 10)
 
@@ -225,6 +239,7 @@ function layer:sample_beam(inputs, opt)
     -- create initial states for all beams
     self:_createInitState(beam_size)
     local state = self.init_state
+    local state_c = self.init_state_c
 
     -- we will write output predictions into tensor seq
     local beam_seq = torch.LongTensor(self.seq_length, beam_size):zero()
@@ -232,6 +247,7 @@ function layer:sample_beam(inputs, opt)
     local beam_logprobs_sum = torch.zeros(beam_size) -- running sum of logprobs for each beam
     local logprobs -- logprobs predicted in last time step, shape (beam_size, vocab_size+1)
     local done_beams = {}
+    -- 第k行到第k行
     local imgk = fc_embed[{ {k,k} }]:expand(beam_size, self.input_encoding_size) -- k'th image feature expanded out
     local conv_feat_k = conv_feat[{ {k,k} }]:expand(beam_size, conv_feat:size(2), self.input_encoding_size) -- k'th image feature expanded out
     local conv_feat_embed_k = conv_feat_embed[{ {k,k} }]:expand(beam_size, conv_feat_embed:size(2), self.input_encoding_size) -- k'th image feature expanded out
@@ -240,6 +256,8 @@ function layer:sample_beam(inputs, opt)
 
       local xt, it, sampleLogprobs
       local new_state
+      local new_state_c
+
       if t == 1 then
         -- feed in the start tokens
         it = torch.LongTensor(beam_size):fill(self.vocab_size+1)
@@ -269,6 +287,7 @@ function layer:sample_beam(inputs, opt)
 
         -- construct new beams
         new_state = net_utils.clone_list(state)
+        new_state_c = state_c:clone()
         local beam_seq_prev, beam_seq_logprobs_prev
         if t > 2 then
           -- well need these as reference when we fork beams around
@@ -288,6 +307,8 @@ function layer:sample_beam(inputs, opt)
             -- copy over state in previous beam q to new beam at vix
             new_state[state_ix][vix] = state[state_ix][v.q]
           end
+          new_state_c[vix] = state_c[v.q]
+
           -- append new end terminal at the end of this beam
           beam_seq[{ t-1, vix }] = v.c -- c'th word is the continuation
           beam_seq_logprobs[{ t-1, vix }] = v.r -- the raw logprob here
@@ -309,6 +330,7 @@ function layer:sample_beam(inputs, opt)
       end
 
       if new_state then state = new_state end -- swap rnn state, if we reassinged beams
+      if new_state_c then state_c = new_state_c end
 
       local inputs = {xt,imgk,unpack(state)}
       local out = self.core:forward(inputs)
@@ -316,9 +338,11 @@ function layer:sample_beam(inputs, opt)
       for i=1,self.num_state do table.insert(state, out[i]) end
       local h_out = out[self.num_state+1]
       local p_out = out[self.num_state+2]
-      local atten_input = {h_out, p_out, conv_feat_k, conv_feat_embed_k}
-      logprobs = self.attention:forward(atten_input)
-
+      local prev_c = state_c
+      local atten_input = {h_out, p_out, conv_feat_k, conv_feat_embed_k, prev_c}
+      local att_out = self.attention:forward(atten_input)
+      logprobs = att_out[1]
+      state_c = att_out[2]
     end
 
     table.sort(done_beams, compare)
@@ -340,6 +364,7 @@ function layer:updateOutput(input)
   local batch_size = seq:size(2)
 
   self:_createInitState(batch_size)
+  local prev_c = self.init_state_c --torch.zeros(batch_size, 50):cuda()
 
   -- first get the nearest neighbor representation.
   self.output:resize(self.seq_length+1, batch_size, self.vocab_size+1):zero()
@@ -353,6 +378,7 @@ function layer:updateOutput(input)
   --self.x_inputs = {}
   self.lookup_tables_inputs = {}
   self.tmax = 0 -- we will keep track of max sequence length encountered in the data for efficiency
+
 
   for t = 1,self.seq_length+1 do
     local can_skip = false
@@ -387,10 +413,11 @@ function layer:updateOutput(input)
       local p_out = out[self.num_state+2]
 
       --forward the attention
-      self.atten_inputs[t] = {h_out, p_out, self.conv_feat, self.conv_feat_embed}
+      self.atten_inputs[t] = {h_out, p_out, self.conv_feat, self.conv_feat_embed, prev_c}
       local atten_out = self.attentions[t]:forward(self.atten_inputs[t])
-
-      self.output:narrow(1,t,1):copy(atten_out)
+      prev_c = atten_out[2]
+      
+      self.output:narrow(1,t,1):copy(atten_out[1])
       self.tmax = t
     end
   end
@@ -404,10 +431,11 @@ function layer:updateGradInput(input, gradOutput)
   local batch_size = self.output:size(2)
   -- go backwards and lets compute gradients
   local dstate = self.init_state -- this works when init_state is all zeros
+  local d_att_c = self.init_state_c
 
   for t=self.tmax,1,-1 do
 
-    local d_atten = self.attentions[t]:backward(self.atten_inputs[t], gradOutput[t])
+    local d_atten = self.attentions[t]:backward(self.atten_inputs[t], {gradOutput[t], d_att_c})
     if not dconv then dconv = d_atten[3] else dconv:add(d_atten[3]) end
     if not dconv_embed then dconv_embed = d_atten[4] else dconv_embed:add(d_atten[4]) end
 
@@ -421,6 +449,7 @@ function layer:updateGradInput(input, gradOutput)
     local dxt = dinputs[1] -- first element is the input vector
     if not dfc then dfc = dinputs[2] else dfc:add(dinputs[2]) end
 
+    d_att_c = d_atten[5]
     dstate = {} -- copy over rest to state grad
     for k=3,self.num_state+2 do table.insert(dstate, dinputs[k]) end
     
